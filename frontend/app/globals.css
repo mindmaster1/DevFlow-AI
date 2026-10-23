@@ -1,0 +1,261 @@
+/* 全局样式与 Tailwind 层入口；这里定义跨页面基础表现，局部交互状态仍由组件控制。 */
+/* 视觉基线：Apple 风格的系统字体、浅灰画布、克制的蓝紫环境光与磨砂玻璃表面。 */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --apple-blue: #0071e3;
+  --apple-blue-hover: #0077ed;
+  --apple-ink: #1d1d1f;
+  --apple-secondary: #6e6e73;
+  --apple-tertiary: #86868b;
+  --apple-canvas: #f5f5f7;
+  --apple-border: rgba(0, 0, 0, 0.08);
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  color: var(--apple-ink);
+  background:
+    radial-gradient(1100px 560px at 12% -8%, rgba(0, 113, 227, 0.1), transparent 60%),
+    radial-gradient(900px 520px at 92% 0%, rgba(191, 90, 242, 0.06), transparent 55%),
+    var(--apple-canvas);
+  background-attachment: fixed;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+::selection {
+  color: #ffffff;
+  background: rgba(0, 113, 227, 0.9);
+}
+
+:focus-visible {
+  outline: 2px solid rgba(0, 113, 227, 0.55);
+  outline-offset: 2px;
+}
+
+/* 细窄、低对比的滚动条，避免打断 Apple 式的留白。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.18) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.16);
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+  background-clip: content-box;
+}
+
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 可复用的磨砂玻璃表面。 */
+.glass {
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+
+/* 卡片基类：柔和的白色表面、清晰但不厚重的层次。 */
+.apple-card {
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 16px 40px rgba(0, 0, 0, 0.06);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  transition:
+    transform 300ms cubic-bezier(0.25, 0.1, 0.25, 1),
+    box-shadow 300ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.apple-card:hover {
+  transform: translateY(-2px);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 24px 60px rgba(0, 0, 0, 0.09);
+}
+
+/* 仪表盘网格：桌面三栏，窄屏逐级收起右栏与项目栏，避免固定宽度把页面撑破。 */
+.dashboard-root {
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  transition: grid-template-columns 260ms ease;
+}
+
+.dashboard-main {
+  grid-template-columns: minmax(460px, 1fr) 8px var(--workspace-width);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+@media (max-width: 1279px) {
+  .dashboard-main {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .dashboard-workspace,
+  .dashboard-resizer {
+    display: none !important;
+  }
+}
+
+@media (max-width: 1023px) {
+  .dashboard-root {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .dashboard-sidebar {
+    display: none !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+.markdown-body {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.markdown-body :where(p, ul, ol, pre, blockquote, table) {
+  margin: 0;
+}
+
+.markdown-body :where(h1, h2, h3) {
+  margin: 0.15rem 0 0;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.02em;
+  color: var(--apple-ink);
+}
+
+.markdown-body h1 {
+  font-size: 1.15rem;
+}
+
+.markdown-body h2 {
+  font-size: 1.05rem;
+}
+
+.markdown-body h3 {
+  font-size: 0.98rem;
+}
+
+.markdown-body :where(ul, ol) {
+  padding-left: 1.25rem;
+}
+
+.markdown-body ul {
+  list-style: disc;
+}
+
+.markdown-body ol {
+  list-style: decimal;
+}
+
+.markdown-body li + li {
+  margin-top: 0.25rem;
+}
+
+.markdown-body code {
+  border-radius: 0.4rem;
+  background: #f5f5f7;
+  padding: 0.08rem 0.34rem;
+  font-size: 0.88em;
+}
+
+.markdown-body pre {
+  overflow: auto;
+  border: 1px solid #d2d2d7;
+  border-radius: 0.75rem;
+  background: #f5f5f7;
+  padding: 0.75rem;
+}
+
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.markdown-body blockquote {
+  border-left: 3px solid var(--apple-blue);
+  padding-left: 0.75rem;
+  color: var(--apple-secondary);
+}
+
+.markdown-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.markdown-body table {
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid #d2d2d7;
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-body th {
+  background: #f5f5f7;
+  color: var(--apple-ink);
+  font-weight: 600;
+}
+
+.markdown-body tr:nth-child(even) td {
+  background: #fafafc;
+}
