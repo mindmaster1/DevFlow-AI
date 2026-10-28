@@ -39,16 +39,20 @@ class LLMClient:
         if self.json_max_tokens is not None:
             payload["max_tokens"] = self.json_max_tokens
         if self.json_fast_review:
+            # 内部按需加载
             from urllib.parse import urlsplit
             if urlsplit(self.base_url).hostname == "api.deepseek.com" and self.model.startswith("deepseek"):
+                # 针对 Deepseek 模型，禁用思考模式，避免模型在 JSON 外面加一层 json 代码块。加速响应速度&避免浪费 token。
                 payload["thinking"] = {"type": "disabled"}
         async with httpx.AsyncClient(timeout=self.json_timeout_seconds) as client:
             try:
+                # 发起HTTPX请求，获取模型分析
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json=payload,
                 )
+                # 把HTTP非2XX的响应转换为python异常catch
                 response.raise_for_status()
                 content = response.json()["choices"][0]["message"]["content"]
                 # 模型的 JSON 字符串先解析为 Python 对象，具体业务 schema 合法性仍交给 Agent 层检查。
@@ -86,6 +90,7 @@ class LLMClient:
             return
 
         payload_messages = [{"role": "system", "content": system_prompt}, *messages]
+        # 打开流式返回的开关
         payload: dict[str, Any] = {"model": self.model, "messages": payload_messages, "stream": True}
         payload.update(prompt_cache_model_kwargs())
         async with httpx.AsyncClient(timeout=60) as client:
@@ -99,7 +104,7 @@ class LLMClient:
                     response.raise_for_status()
                 except httpx.HTTPStatusError:
                     return
-                # 逐行消费供应商 SSE，只处理 data 行；模型文本流会被上层再封装成自己的业务事件。
+                # 逐行消费供应商 SSE，只处理 data 行（也就是只输出模型最基础的返回）；模型文本流封装成自己的业务事件。
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -115,4 +120,5 @@ class LLMClient:
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                     content = delta.get("content")
                     if content:
+                        # yield 流式输出每个增量文本块
                         yield str(content)
