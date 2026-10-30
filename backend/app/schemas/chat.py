@@ -4,6 +4,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 
+#BaseModel 用于定义请求和响应的字段，BaseModel = 自动类型校验 + 自动序列化 + 默认值安全处理的增强数据类。
 class ChatRequest(BaseModel):
     repo_id: UUID  # 当前仓库内部 UUID
     conversation_id: UUID | None = None  # 仓库中的独立会话；空值走兼容默认会话
