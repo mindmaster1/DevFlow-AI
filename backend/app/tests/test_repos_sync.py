@@ -4,13 +4,14 @@ import os
 
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import Base, Document, Issue, Repository
 from app.schemas.repos import RepoSyncRequest
-from app.services.repos_sync import sync_repository
+from app.services.repos_sync import apply_repository_metadata, describe_github_error, sync_repository
 
 
 def _db_session():
@@ -69,3 +70,43 @@ async def test_sync_repository_persists_facts_without_triggering_rag(monkeypatch
     assert issue.number == 78
     assert issue.title == "Error: Could not import 'app'."
     assert db.query(Document).filter(Document.repo_id == repo.id).count() == 0
+
+
+def test_apply_repository_metadata_updates_remote_fields_and_keeps_local_config() -> None:
+    repo = Repository(
+        owner="acme",
+        name="demo",
+        full_name="acme/demo",
+        clone_url="https://old.example/acme/demo.git",
+        local_path="/tmp/checkout",
+        checkout_mode="managed",
+    )
+    apply_repository_metadata(
+        repo,
+        {
+            "id": 4242,
+            "description": "Remote description",
+            "default_branch": "trunk",
+            "clone_url": "https://new.example/acme/demo.git",
+        },
+    )
+    assert repo.description == "Remote description"
+    assert repo.default_branch == "trunk"
+    assert repo.clone_url == "https://new.example/acme/demo.git"
+    assert repo.github_id == 4242
+    assert repo.local_path == "/tmp/checkout"
+    assert repo.checkout_mode == "managed"
+
+
+def test_apply_repository_metadata_uses_clone_url_fallback() -> None:
+    repo = Repository(owner="acme", name="demo", full_name="acme/demo", clone_url=None)
+    apply_repository_metadata(repo, {"id": 1}, clone_url_fallback="https://fallback.example/acme/demo.git")
+    assert repo.clone_url == "https://fallback.example/acme/demo.git"
+
+
+def test_describe_github_error_formats_status_and_network_failures() -> None:
+    request = httpx.Request("GET", "https://api.github.com/repos/acme/demo")
+    response = httpx.Response(403, request=request)
+    status_error = httpx.HTTPStatusError("forbidden", request=request, response=response)
+    assert describe_github_error(status_error) == "HTTP 403"
+    assert describe_github_error(httpx.ConnectError("unreachable", request=request)) == "ConnectError"

@@ -62,6 +62,8 @@ COMPACTABLE_TOOL_HINTS = (
     "rag.search_similar_documents",
     "devflow_search_evidence",
     "repo_health.generate_summary",
+    "repo.get_sync_status",
+    "ci.list_workflow_runs",
     "ci_debug_agent.analyze_workflow_run",
     "read",
     "grep",

@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
+from uuid import uuid4
 
 import pytest
 import httpx
@@ -20,6 +21,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.routes import repos
 from app.api.routes.chat import _build_conversation_tools, _build_engineering_workflow_runtime, _engineering_workflow_response, _persist_engineering_workflow
 from app.core.config import settings
+from app.core.security import encrypt_token
 from app.db.models import AgentWorkflowRun, Base, Issue, PRFile, PRReviewComment, Repository, WorkflowRun
 from app.db.session import get_db
 from app.schemas.repos import RepoSyncRequest
@@ -34,7 +36,16 @@ from app.services.repos_sync import sync_repository
 
 @pytest.fixture
 def github_server():
-    state = {"data": {}, "errors": {}, "requests": [], "bad_shape": False, "repeat_link": False, "disconnect": False}
+    state = {
+        "data": {},
+        "metadata": {},
+        "errors": {},
+        "requests": [],
+        "auth_headers": [],
+        "bad_shape": False,
+        "repeat_link": False,
+        "disconnect": False,
+    }
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -46,17 +57,25 @@ def github_server():
             page = int(query.get("page", [1])[0])
             per_page = int(query.get("per_page", [30])[0])
             state["requests"].append((parsed.path, page, per_page))
+            state["auth_headers"].append(self.headers.get("Authorization"))
             if state["disconnect"]:
                 self.close_connection = True
                 return
             status = state["errors"].get((parsed.path, page), state["errors"].get(parsed.path, 200))
-            items = state["data"].get(parsed.path, [])
-            batch = items[(page - 1) * per_page:page * per_page]
-            payload = batch
-            if parsed.path.endswith("/actions/runs"):
-                payload = {"total_count": len(items), "workflow_runs": batch}
-            elif parsed.path.endswith("/jobs"):
-                payload = {"total_count": len(items), "jobs": batch}
+            metadata = state["metadata"].get(parsed.path)
+            has_next = False
+            if metadata is not None:
+                # 仓库元数据是单个 JSON 对象，不走列表分页。
+                payload = metadata
+            else:
+                items = state["data"].get(parsed.path, [])
+                batch = items[(page - 1) * per_page:page * per_page]
+                payload = batch
+                if parsed.path.endswith("/actions/runs"):
+                    payload = {"total_count": len(items), "workflow_runs": batch}
+                elif parsed.path.endswith("/jobs"):
+                    payload = {"total_count": len(items), "jobs": batch}
+                has_next = page * per_page < len(items)
             if state["bad_shape"]:
                 payload = {"unexpected": "not a list"}
             if status != 200:
@@ -65,7 +84,7 @@ def github_server():
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            if page * per_page < len(items) or state["repeat_link"]:
+            if has_next or state["repeat_link"]:
                 params = {key: values[0] for key, values in query.items()}
                 params["page"] = page if state["repeat_link"] else page + 1
                 next_url = f"http://127.0.0.1:{self.server.server_port}{parsed.path}?{urlencode(params)}"
@@ -324,6 +343,7 @@ async def test_health_summary_and_workflow_gate_missing_or_incomplete_data(githu
     if state == "full":
         assert result["status"] == "success"
         assert result["evidence_count"] == 207
+        assert "CI 1 次（成功 1，失败 0，其它 0）" in result["summary"]
         assert "整体健康仍需" in report["final_answer"]
     else:
         assert any(f["finding_type"] == "evidence_gap" and f["severity"] == "blocker" for f in report["observation"]["findings"])
@@ -370,6 +390,211 @@ def test_sync_api_exposes_persisted_failure_and_complete_pagination(github_serve
         assert client.get(f"/api/repos/{repo.id}/sync-status").json()["status"] == "completed"
         listing = client.get("/api/repos").json()
         assert listing[0]["sync_metadata"]["status"] == "completed"
+
+
+def _api_app(db, monkeypatch):
+    app = FastAPI()
+    app.include_router(repos.router, prefix="/api/repos")
+    app.dependency_overrides[get_db] = lambda: db
+    scheduled = []
+
+    async def record_code_analysis(repo_id):
+        scheduled.append(repo_id)
+
+    monkeypatch.setattr(repos, "sync_repository_code_analysis_by_id", record_code_analysis)
+    return app, scheduled
+
+
+def test_full_sync_endpoint_refreshes_metadata_and_all_pages(github_server, database, monkeypatch):
+    populate(github_server)
+    github_server["metadata"]["/repos/acme/demo"] = {
+        "id": 4242,
+        "description": "Remote description",
+        "default_branch": "trunk",
+        "clone_url": "https://example.test/acme/demo.git",
+    }
+    db, repo = database
+    repo.default_branch = "master"
+    repo.github_token_encrypted = encrypt_token("token-abc", settings.token_encryption_key)
+    db.commit()
+    app, scheduled = _api_app(db, monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/repos/{repo.id}/full-sync")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["synced"] == {"issues": 205, "pull_requests": 1, "workflow_runs": 1}
+    assert body["sources"]["issues"]["pages"] == 3
+    assert all(source["complete"] for source in body["sources"].values())
+    assert body["metadata_refreshed"] is True
+    assert body["metadata_error"] is None
+    assert body["metadata"]["default_branch"] == "trunk"
+    assert body["metadata"]["github_id"] == 4242
+    assert "Bearer token-abc" in github_server["auth_headers"]
+    assert scheduled == [repo.id]
+
+    db.expire_all()
+    updated = db.get(Repository, repo.id)
+    assert updated.description == "Remote description"
+    assert updated.default_branch == "trunk"
+    assert updated.clone_url == "https://example.test/acme/demo.git"
+    assert updated.github_id == 4242
+    assert updated.sync_metadata["limit"] is None
+
+
+def test_full_sync_metadata_failure_is_best_effort(github_server, database, monkeypatch):
+    populate(github_server)
+    github_server["errors"]["/repos/acme/demo"] = 403
+    db, repo = database
+    repo.default_branch = "master"
+    db.commit()
+    app, scheduled = _api_app(db, monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/repos/{repo.id}/full-sync")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["synced"] == {"issues": 205, "pull_requests": 1, "workflow_runs": 1}
+    assert body["metadata_refreshed"] is False
+    assert body["metadata_error"] == "metadata: HTTP 403"
+    assert scheduled == [repo.id]
+
+    db.expire_all()
+    assert db.get(Repository, repo.id).default_branch == "master"
+
+
+def test_full_sync_total_source_failure_still_returns_structured_body(github_server, database, monkeypatch):
+    github_server["metadata"]["/repos/acme/demo"] = {"id": 1, "default_branch": "master"}
+    for path in ("issues", "pulls", "actions/runs"):
+        github_server["errors"][f"/repos/acme/demo/{path}"] = 403
+    db, repo = database
+    app, scheduled = _api_app(db, monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/repos/{repo.id}/full-sync")
+
+    # 刻意区别于 /sync 的 502：全量同步要保留 sources/errors 让前端展示逐来源结果。
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["synced"] == {"issues": 0, "pull_requests": 0, "workflow_runs": 0}
+    assert len(body["errors"]) == 3
+    assert scheduled == [repo.id]
+
+
+def test_full_sync_unknown_repo_returns_404(github_server, database, monkeypatch):
+    db, _repo = database
+    app, _scheduled = _api_app(db, monkeypatch)
+    with TestClient(app) as client:
+        response = client.post(f"/api/repos/{uuid4()}/full-sync")
+    assert response.status_code == 404
+
+
+def test_connect_reuses_shared_metadata_helper(github_server, database, monkeypatch):
+    github_server["metadata"]["/repos/acme/demo"] = {
+        "id": 5151,
+        "description": "Connected description",
+        "default_branch": "trunk",
+        "clone_url": "https://example.test/acme/demo.git",
+    }
+    db, _repo = database
+    app, scheduled = _api_app(db, monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/repos/connect",
+            json={
+                "owner": "acme",
+                "repo": "demo",
+                "provider": "github_compatible",
+                "api_base_url": github_server["url"],
+                "token": "token-abc",
+                "initial_sync_limit": 5,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["connected"] is True
+    db.expire_all()
+    updated = db.query(Repository).filter(Repository.full_name == "acme/demo").one()
+    assert updated.description == "Connected description"
+    assert updated.default_branch == "trunk"
+    assert updated.clone_url == "https://example.test/acme/demo.git"
+    assert updated.github_id == 5151
+    assert scheduled == [updated.id]
+
+
+@pytest.mark.asyncio
+async def test_ci_status_tools_report_successful_runs_instead_of_missing_data(github_server, database):
+    db, repo = database
+    now = datetime.now(timezone.utc)
+    repo.sync_metadata = {
+        "status": "completed",
+        "sources": {
+            "issues": {"status": "completed", "count": 0, "complete": True, "pages": 1},
+            "pull_requests": {"status": "completed", "count": 0, "complete": True, "pages": 1},
+            "workflow_runs": {"status": "completed", "count": 2, "complete": True, "pages": 1},
+        },
+        "errors": [],
+        "attempted_at": now.isoformat(),
+    }
+    repo.last_sync_at = now
+    db.add_all(
+        [
+            WorkflowRun(repo_id=repo.id, github_run_id=101, name="Backend CI", status="completed", conclusion="success", created_at=now),
+            WorkflowRun(repo_id=repo.id, github_run_id=100, name="Frontend CI", status="completed", conclusion="success", created_at=now - timedelta(minutes=5)),
+        ]
+    )
+    db.commit()
+    tools = _build_conversation_tools(repo, None, db)
+
+    health = await tools["repo_health.generate_summary"]({}, {})
+    assert health["data_status"] == "ready"
+    assert "已同步 2 次 CI 运行" in health["answer"]
+    assert "2 次成功" in health["answer"]
+    assert "已同步范围内没有失败运行" in health["answer"]
+    assert "还没有同步到失败 CI 运行" not in health["answer"]
+
+    runs = await tools["ci.list_workflow_runs"]({}, {})
+    assert runs["route"] == "ci_runs"
+    assert runs["ci"]["status"] == "all_success"
+    assert "共 2 条" in runs["answer"]
+    assert "Backend CI" in runs["answer"]
+    assert len(runs["runs"]) == 2
+
+    sync_status = await tools["repo.get_sync_status"]({}, {})
+    assert sync_status["route"] == "repo_sync_status"
+    assert sync_status["sync_status"]["status"] == "completed"
+    assert sync_status["sync_status"]["counts"]["workflow_runs"] == 2
+    assert "workflow_runs: status=completed" in sync_status["answer"]
+
+    ci_debug = await tools["ci_debug_agent.analyze_workflow_run"]({}, {})
+    assert ci_debug["route"] == "ci_status"
+    assert "没有可排障的失败 CI" in ci_debug["answer"]
+    assert "2 次成功" in ci_debug["answer"]
+    assert "尚未同步" not in ci_debug["answer"]
+
+
+@pytest.mark.asyncio
+async def test_ci_status_tools_distinguish_no_runs_from_all_success(github_server, database):
+    db, repo = database
+    tools = _build_conversation_tools(repo, None, db)
+
+    health = await tools["repo_health.generate_summary"]({}, {})
+    assert "尚未同步到 CI 运行记录" in health["answer"]
+
+    runs = await tools["ci.list_workflow_runs"]({}, {})
+    assert runs["ci"]["status"] == "no_runs"
+    assert "共 0 条" in runs["answer"]
+
+    ci_debug = await tools["ci_debug_agent.analyze_workflow_run"]({}, {})
+    assert ci_debug["route"] == "ci_status"
+    assert "尚未同步到任何 CI 运行记录" in ci_debug["answer"]
 
 
 @pytest.mark.asyncio

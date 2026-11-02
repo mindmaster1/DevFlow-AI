@@ -1,6 +1,7 @@
 # GitHub 同步服务：按远端稳定 ID 更新本地 Issue/PR/CI，再保存逐来源的分页覆盖和失败信息。
 # 请求失败与成功但为空必须区分；不能用失败响应清掉已有 PR 文件、评论或 Job 明细。
 from datetime import datetime, timezone
+from typing import Any
 from uuid import UUID
 
 import httpx
@@ -12,6 +13,7 @@ from app.core.security import decrypt_token
 from app.db.models import Issue, PRFile, PRReviewComment, PullRequest, Repository, WorkflowRun
 from app.schemas.repos import RepoSyncRequest, RepoSyncResponse
 from app.services.github.actions import get_workflow_run_logs, list_workflow_run_jobs, list_workflow_runs
+from app.services.github.client import GitHubClient
 from app.services.github.issues import list_issues
 from app.services.github.pull_requests import list_pull_request_files, list_pull_request_review_comments, list_pull_requests
 
@@ -26,6 +28,41 @@ def login_of(user: dict | None) -> str | None:
     return user.get("login") if user else None
 
 
+def repository_token(repo: Repository) -> str | None:
+    # 令牌解密集中在这里，同步与元数据刷新共用同一份凭据来源。
+    if not repo.github_token_encrypted:
+        return None
+    return decrypt_token(repo.github_token_encrypted, settings.token_encryption_key)
+
+
+def describe_github_error(exc: Exception) -> str:
+    # 错误摘要用于 sources/errors 与前端提示，保持与既有同步响应一致的简短格式。
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    return type(exc).__name__
+
+
+# 只更新远端只读元数据；token、local_path、checkout_mode 属于本地/用户配置，不能被远端响应覆盖。
+def apply_repository_metadata(
+    repo: Repository,
+    repo_data: dict[str, Any],
+    *,
+    clone_url_fallback: str | None = None,
+) -> None:
+    repo.description = repo_data.get("description")
+    repo.default_branch = repo_data.get("default_branch")
+    repo.clone_url = repo_data.get("clone_url") or clone_url_fallback or repo.clone_url
+    repo.github_id = repo_data.get("id")
+
+
+# 全量同步前刷新仓库元数据；调用方决定刷新失败是否阻断后续事实同步。
+async def refresh_repository_metadata(db: Session, repo: Repository) -> dict[str, Any]:
+    repo_data = await GitHubClient(repository_token(repo), repo.api_base_url).get_repo(repo.owner, repo.name)
+    apply_repository_metadata(repo, repo_data)
+    db.commit()
+    return repo_data
+
+
 # 仓库同步总流程：每个主数据源分别拉取、按远端稳定 ID 更新本地记录，再补 PR/CI 明细。
 # sources 的 skipped/empty/completed/partial/failed 描述覆盖；synced 只描述实际处理条数，二者不可互相替代。
 # Issue/PR 的 number 是仓库内展示编号，github_*_id 是远端稳定标识，repo.id 是本系统内部仓库 UUID。
@@ -38,7 +75,7 @@ async def sync_repository(db: Session, repo: Repository, payload: RepoSyncReques
         raise HTTPException(status_code=400, detail=f"{repo.provider} sync is not implemented yet")
 
     synced = {"issues": 0, "pull_requests": 0, "workflow_runs": 0}  # 本轮各类实际处理条数；同步尚未执行，三类都从 0 计数，不是数据库已有记录总量
-    token = decrypt_token(repo.github_token_encrypted, settings.token_encryption_key) if repo.github_token_encrypted else None
+    token = repository_token(repo)
     base_url = repo.api_base_url
     # 先假设三类均未选择，再由实际请求覆盖；未选择不等于请求失败，也不参与“全部失败”的判定。
     sources = {key: {"status": "skipped", "count": 0, "complete": False, "pages": 0} for key in synced}
@@ -53,8 +90,7 @@ async def sync_repository(db: Session, repo: Repository, payload: RepoSyncReques
         try:
             items = await loader(*args, **kwargs)
         except (httpx.HTTPError, ValueError) as exc:
-            reason = f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
-            message = f"{source}{'/' + detail if detail else ''}: {reason}"
+            message = f"{source}{'/' + detail if detail else ''}: {describe_github_error(exc)}"
             errors.append(message)
             sources[source]["status"] = "partial" if detail else "failed"
             sources[source]["complete"] = False

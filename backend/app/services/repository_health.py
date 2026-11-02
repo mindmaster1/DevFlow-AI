@@ -4,6 +4,45 @@ from datetime import datetime, timedelta, timezone
 from app.db.models import Issue, PullRequest, Repository, WorkflowRun
 
 
+def _run_time(run: WorkflowRun) -> datetime:
+    value = run.created_at or run.updated_at
+    if value is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _describe_run(run: WorkflowRun | None) -> dict | None:
+    if run is None:
+        return None
+    return {
+        "id": str(run.id),
+        "github_run_id": run.github_run_id,
+        "name": run.name,
+        "status": run.status,
+        "conclusion": run.conclusion,
+        "html_url": run.html_url,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    }
+
+
+# CI 结论必须区分“没有同步到运行”和“同步到的运行全部成功”，否则全绿会被误报成数据缺失。
+def workflow_run_summary(runs: list[WorkflowRun]) -> dict:
+    ordered = sorted(runs, key=_run_time, reverse=True)
+    success = [run for run in ordered if run.conclusion == "success"]
+    failure = [run for run in ordered if run.conclusion == "failure"]
+    other = [run for run in ordered if run.conclusion not in {"success", "failure"}]
+    latest_failure = next((run for run in ordered if run.conclusion == "failure"), None)
+    return {
+        "total": len(ordered),
+        "success": len(success),
+        "failure": len(failure),
+        "other": len(other),
+        "status": "no_runs" if not ordered else ("has_failures" if failure else "all_success"),
+        "latest": _describe_run(ordered[0] if ordered else None),
+        "latest_failure": _describe_run(latest_failure),
+    }
+
+
 def repository_health_snapshot(repo: Repository, issues: list[Issue], prs: list[PullRequest], runs: list[WorkflowRun]) -> dict:
     """Describe local evidence and its coverage, without treating absence as health."""
     evidence_count = len(issues) + len(prs) + len(runs)
@@ -38,6 +77,7 @@ def repository_health_snapshot(repo: Repository, issues: list[Issue], prs: list[
         "status": "error" if state == "failed" else ("skipped" if state == "empty" or not evidence_count else "success"),
         "message": messages[state],
         "evidence_count": evidence_count,
+        "ci": workflow_run_summary(runs),
         "confidence": None,  # No calibrated probability model exists for these counts.
         "sources": sources,
         "sync_errors": metadata.get("errors") or [],

@@ -9,19 +9,20 @@ from pathlib import Path
 from urllib.parse import urlparse
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.db.models import ActionDraft, AgentRun, AgentTaskRun, AgentWorkflowRun, AnalysisResult, AuditLog, ChatFeedback, ChatMessage, ChatSession, CodeRelation, CodeSymbol, Conversation, ConversationMemory, Document, EvidenceItem, Issue, KnowledgeBaseConfig, KnowledgeGraphEdge, KnowledgeSourceDocument, MemoryCandidate, PRFile, PRReviewComment, ProjectIndexState, PullRequest, RecallEvent, Repository, RetrievalTestRun, ThreadMemory, WorkflowRun, Workspace
 from app.db.session import get_db
-from app.schemas.repos import RepoConnectRequest, RepoConnectResponse, RepoResponse, RepoSyncRequest, RepoSyncResponse
+from app.schemas.repos import RepoConnectRequest, RepoConnectResponse, RepoFullSyncResponse, RepoResponse, RepoSyncRequest, RepoSyncResponse
 from app.core.config import settings
 from app.core.security import encrypt_token
 from app.services.github.client import GitHubClient
 from app.services.code_analysis import sync_repository_code_analysis_by_id
 from app.services.rag.vector_store import delete_milvus_documents
-from app.services.repos_sync import sync_repository
+from app.services.repos_sync import apply_repository_metadata, describe_github_error, refresh_repository_metadata, sync_repository
 
 router = APIRouter()
 
@@ -229,12 +230,13 @@ async def connect_repo(payload: RepoConnectRequest, background_tasks: Background
     repo.api_base_url = base_url
     if token:
         repo.github_token_encrypted = encrypt_token(token, settings.token_encryption_key)
-    repo.description = repo_data.get("description")
-    repo.default_branch = repo_data.get("default_branch")
-    repo.clone_url = repo_data.get("clone_url") or (remote_info.clone_url if remote_info else f"https://github.com/{owner}/{repo_name}.git")
+    apply_repository_metadata(
+        repo,
+        repo_data,
+        clone_url_fallback=remote_info.clone_url if remote_info else f"https://github.com/{owner}/{repo_name}.git",
+    )
     repo.local_path = str(checkout_path) if checkout_path else None
     repo.checkout_mode = checkout_mode
-    repo.github_id = repo_data.get("id")
     db.commit()
     db.refresh(repo)
     sync_result: RepoSyncResponse | None = None
@@ -306,6 +308,55 @@ async def sync_repo(
         response.status_code = 502
     background_tasks.add_task(sync_repository_code_analysis_by_id, repo.id)
     return result
+
+
+# 全量同步等价于首次导入后的完整重跑：刷新远端元数据、抓完全部分页、再后台重建代码分析。
+# 元数据刷新是 best-effort，失败不阻断事实同步；事实同步失败仍返回 200 以保留逐来源覆盖信息。
+# 该接口不使用 limit，因此 sync_metadata.limit 会记录为 null，表示本次按全部分页执行。
+@router.post("/{repo_id}/full-sync", response_model=RepoFullSyncResponse)
+async def full_sync_repo(
+    repo_id: UUID,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> RepoFullSyncResponse:
+    repo = db.get(Repository, repo_id)
+    if repo is None:
+        raise HTTPException(status_code=404, detail="未找到仓库")
+    if repo.provider not in SUPPORTED_CONNECT_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"{repo.provider} full sync is not implemented yet")
+
+    metadata_refreshed = False
+    metadata_error: str | None = None
+    try:
+        await refresh_repository_metadata(db, repo)
+        metadata_refreshed = True
+    except (httpx.HTTPError, ValueError) as exc:
+        # 元数据只是辅助信息；权限或限流问题不应让用户失去同步 Issue/PR/CI 的恢复入口。
+        metadata_error = f"metadata: {describe_github_error(exc)}"
+
+    result = await sync_repository(
+        db,
+        repo,
+        RepoSyncRequest(
+            sync_issues=True,
+            sync_pull_requests=True,
+            sync_workflow_runs=True,
+            limit=None,
+        ),
+    )
+    # 元数据已先 commit，后台任务按最新 default_branch 检出；代码图完成与否不能由本响应承诺。
+    background_tasks.add_task(sync_repository_code_analysis_by_id, repo.id)
+    return RepoFullSyncResponse(
+        **result.model_dump(),
+        metadata_refreshed=metadata_refreshed,
+        metadata_error=metadata_error,
+        metadata={
+            "description": repo.description,
+            "default_branch": repo.default_branch,
+            "clone_url": repo.clone_url,
+            "github_id": repo.github_id,
+        },
+    )
 
 
 @router.post("/{repo_id}/select")
