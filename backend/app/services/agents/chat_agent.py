@@ -109,6 +109,8 @@ class ChatAgent(BaseAgent):
         "workspace.read_file",
         "workspace.search_code",
         "repo_health.generate_summary",
+        "repo.get_sync_status",
+        "ci.list_workflow_runs",
         "rag.search_similar_documents",
         "issue_agent.analyze_issue",
         "pr_review_agent.analyze_pr",
@@ -1098,6 +1100,9 @@ class ChatAgent(BaseAgent):
             "除非存在单独的已确认写入工具，否则只返回草稿。"
             "对于合并就绪度、当前阻塞、优先级规划，或需要 Issue + PR + CI + RAG 综合判断的跨领域工程决策，"
             "优先使用 workflow.run_engineering_review 工具。"
+            "询问 CI 有哪些运行、成功/失败数量、是否全部通过时，使用 ci.list_workflow_runs；"
+            "询问同步状态、覆盖范围或数据为何缺失时，使用 repo.get_sync_status；"
+            "只有需要失败根因时才使用 ci_debug_agent.analyze_workflow_run。"
         )
 
     # 把本轮问题与服务端上下文投影成模型的用户提示，工具预算由 context budget 提供。
@@ -1167,6 +1172,8 @@ class ChatAgent(BaseAgent):
 
         if action in {
             "repo_health.generate_summary",
+            "repo.get_sync_status",
+            "ci.list_workflow_runs",
             "rag.search_similar_documents",
             "issue_agent.analyze_issue",
             "pr_review_agent.analyze_pr",
@@ -1462,11 +1469,13 @@ class ChatAgent(BaseAgent):
             "workspace.list_files": "列出所选仓库本地 checkout 下的文件。只读，用于探索源码树。",
             "workspace.read_file": "从所选仓库 checkout 中读取文本文件，可指定 start_line 和 line_count。只读。",
             "workspace.search_code": "在所选仓库 checkout 中搜索代码或文档文本。只读。",
-            "repo_health.generate_summary": "总结当前仓库健康状态。",
+            "repo_health.generate_summary": "总结当前仓库健康状态，包含 Issue/PR/CI 的本地计数和同步覆盖说明。",
+            "repo.get_sync_status": "读取当前仓库最近一次同步的状态、各数据源覆盖范围、同步错误和本地记录数量。只读。",
+            "ci.list_workflow_runs": "列出当前仓库已同步的 GitHub Actions CI 运行，可按 conclusion 过滤，返回成功/失败数量、最近运行和同步覆盖。只读；用于确认有没有 CI 记录，不分析失败根因。",
             "rag.search_similar_documents": "搜索项目历史与非结构化知识，包括 Issue 描述、PR 说明与 Review 讨论、失败 CI 日志、项目文档、上传知识和已批准的长期记忆。可传入改写后的 query，并用不同 query 连续调用以补查和交叉验证。源码优先使用 workspace 工具，团队成员和实时状态使用对应结构化工具。",
             "issue_agent.analyze_issue": "分析最新同步的 Issue。",
             "pr_review_agent.analyze_pr": "分析最新同步的 PR。",
-            "ci_debug_agent.analyze_workflow_run": "分析最新失败的 CI 运行。",
+            "ci_debug_agent.analyze_workflow_run": "分析最新失败的 CI 运行；如果没有失败运行，应改用 ci.list_workflow_runs 查看已同步的 CI 结果。",
             "report_agent.generate_weekly_report": "生成仓库报告。",
             "safety_agent.classify_action_risk": "安全起草有风险的写操作或外部发送动作。",
             "workflow.run_engineering_review": "运行 Planner -> 专用 Agent -> Observer -> Synthesis 工作流，用于 PR 就绪度、阻塞项、优先级和多 Agent 仓库审查等跨领域工程决策。",

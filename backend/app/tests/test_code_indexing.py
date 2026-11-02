@@ -4,6 +4,8 @@ import subprocess
 import uuid
 from types import SimpleNamespace
 
+import pytest
+
 from app.core.config import settings
 from app.services import code_analysis
 
@@ -25,6 +27,34 @@ def test_sync_checkout_uses_cached_checkout_when_update_fails(tmp_path, monkeypa
     monkeypatch.setattr(code_analysis, "_run_git", fail_run)
 
     assert code_analysis._sync_checkout(repo, None) == checkout
+
+
+@pytest.mark.parametrize("branch", ["main", "develop"])
+def test_sync_checkout_resets_shallow_managed_checkout_to_fetched_head(tmp_path, monkeypatch, branch) -> None:
+    monkeypatch.setattr(settings, "repo_checkout_dir", str(tmp_path))
+    repo = SimpleNamespace(
+        id=uuid.uuid4(),
+        full_name="owner/repo",
+        clone_url="https://github.com/owner/repo.git",
+        default_branch=branch,
+    )
+    checkout = code_analysis._repo_checkout_path(repo)
+    (checkout / ".git").mkdir(parents=True)
+
+    calls = []
+
+    def record_run(args, cwd=None):
+        calls.append(args)
+
+    monkeypatch.setattr(code_analysis, "_run_git", record_run)
+
+    assert code_analysis._sync_checkout(repo, None) == checkout
+    # 浅克隆不能用 pull --ff-only；必须 fetch 后把 app-owned 分支重置到 FETCH_HEAD。
+    assert calls == [
+        ["fetch", "--depth", "1", "origin", branch],
+        ["checkout", "-B", branch, "FETCH_HEAD"],
+    ]
+    assert all("pull" not in args for args in calls)
 
 
 def test_sync_checkout_uses_configured_local_repo_without_updating(tmp_path, monkeypatch) -> None:

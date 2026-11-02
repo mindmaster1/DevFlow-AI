@@ -185,9 +185,10 @@ def _sync_checkout(repo: Repository, token: str | None) -> Path:
 
     if (target / ".git").exists() or _is_git_work_tree(target):
         try:
+            # 托管 checkout 是 depth-1 浅克隆，历史不完整时 pull --ff-only 无法快进，
+            # 会一直停留在旧提交。直接 fetch 默认分支并把 app-owned 分支重置到 FETCH_HEAD。
             _run_git(["fetch", "--depth", "1", "origin", branch], cwd=target)
-            _run_git(["checkout", branch], cwd=target)
-            _run_git(["pull", "--ff-only", "origin", branch], cwd=target)
+            _run_git(["checkout", "-B", branch, "FETCH_HEAD"], cwd=target)
         except subprocess.CalledProcessError as exc:
             logger.warning("更新现有 checkout %s 失败，将使用缓存文件：%s", target, (exc.stderr or exc).strip())
         return target

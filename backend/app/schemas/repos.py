@@ -71,3 +71,10 @@ class RepoSyncResponse(BaseModel):
     sources: dict[str, dict] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     message: str = ""
+
+
+class RepoFullSyncResponse(RepoSyncResponse):
+    # 全量同步在事实数据之外还尝试刷新仓库元数据；元数据失败不阻断事实同步，需单独报告。
+    metadata_refreshed: bool = False
+    metadata_error: str | None = None
+    metadata: dict | None = None  # 仅 description/default_branch/clone_url/github_id

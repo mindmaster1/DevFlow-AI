@@ -37,7 +37,7 @@ from app.services.rag.vector_store import add_document
 from app.schemas.workflow import WorkflowSpec, WorkflowTask, WorkflowTaskResult
 from app.services.skills import SkillRegistry, get_skill_registry
 from app.services.permissions import ensure_demo_user, write_audit_log
-from app.services.repository_health import repository_health_snapshot
+from app.services.repository_health import repository_health_snapshot, workflow_run_summary
 
 router = APIRouter()
 
@@ -336,16 +336,29 @@ def _repo_health_answer(repo: Repository, issues: list[Issue], prs: list[PullReq
     snapshot = repository_health_snapshot(repo, issues, prs, runs)
     notice = f"当前仓库：{repo.full_name}\n\n数据说明：{snapshot['message']}"
     if not snapshot["evidence_count"]:
-        return notice
+        # 即使没有任何证据，也要明确说明 CI 是没有同步到记录，而不是“全部通过”。
+        return f"{notice}\n\n- CI：尚未同步到 CI 运行记录。"
     open_issues = [item for item in issues if item.state == "open"]
     open_prs = [item for item in prs if item.state == "open"]
     merged_prs = [item for item in prs if item.merged_at]
-    failed_runs = [item for item in runs if item.conclusion == "failure"]
+    ci = snapshot["ci"]
     latest_issues = sorted(open_issues, key=_item_time, reverse=True)[:3]
     latest_prs = sorted(prs, key=_item_time, reverse=True)[:3]
     issue_titles = _join_items([f"#{item.number} {item.title}" for item in latest_issues], "没有打开的 Issue")
     pr_titles = _join_items([f"#{item.number} {item.title}" for item in latest_prs], "没有 PR 记录")
-    ci_text = f"已同步 {len(failed_runs)} 次失败 CI 运行" if failed_runs else "还没有同步到失败 CI 运行"
+    # 全绿与“没有同步到 run”是两种完全不同的结论，不能都写成“没有失败 CI”。
+    if not ci["total"]:
+        ci_text = "尚未同步到 CI 运行记录"
+    else:
+        ci_text = f"已同步 {ci['total']} 次 CI 运行：{ci['success']} 次成功、{ci['failure']} 次失败、{ci['other']} 次未完成或其它"
+        if ci["latest"]:
+            latest = ci["latest"]
+            ci_text += f"；最近一次「{latest['name']}」{latest['conclusion'] or latest['status']}（{latest['created_at'] or '时间未知'}）"
+        if not ci["failure"]:
+            ci_text += "；已同步范围内没有失败运行"
+    workflow_source = snapshot["sources"].get("workflow_runs") or {}
+    if workflow_source:
+        ci_text += f"；CI 同步覆盖：{workflow_source.get('status', 'unknown')}，{workflow_source.get('count', 0)} 条，complete={workflow_source.get('complete')}"
     return (
         f"{notice}\n\n"
         f"- Issues：{len(open_issues)} 个打开。近期关注：{issue_titles}。\n"
@@ -747,6 +760,7 @@ def _build_engineering_workflow_runtime(
     async def run_repo_health(task: WorkflowTask, spec: WorkflowSpec, workflow_context: dict[str, Any]) -> WorkflowTaskResult:
         answer = _repo_health_answer(repo, issues, prs, runs)
         snapshot = repository_health_snapshot(repo, issues, prs, runs)
+        ci = snapshot["ci"]
         open_issue_count = len([item for item in issues if item.state == "open"])
         open_pr_count = len([item for item in prs if item.state == "open"])
         return WorkflowTaskResult(
@@ -754,13 +768,20 @@ def _build_engineering_workflow_runtime(
             agent_name=task.agent_name,
             task_type=task.task_type,
             status=snapshot["status"],
-            summary=f"{snapshot['message']} 本地记录：{open_issue_count} 个打开的 Issue，{open_pr_count} 个打开的 PR，{len(failed_runs)} 次失败 CI。",
+            summary=(
+                f"{snapshot['message']} 本地记录：{open_issue_count} 个打开的 Issue，"
+                f"{open_pr_count} 个打开的 PR，CI {ci['total']} 次"
+                f"（成功 {ci['success']}，失败 {ci['failure']}，其它 {ci['other']}）。"
+            ),
             output={
                 **snapshot,
                 "answer": answer,
                 "open_issues": open_issue_count,
                 "open_prs": open_pr_count,
-                "failed_ci": len(failed_runs),
+                "ci_total": ci["total"],
+                "ci_success": ci["success"],
+                "failed_ci": ci["failure"],
+                "ci_other": ci["other"],
             },
             evidence_count=snapshot["evidence_count"],
             confidence=snapshot["confidence"],
@@ -1129,6 +1150,51 @@ def _build_conversation_tools(repo: Repository | None, conversation: Conversatio
             "citations": [{"type": "repository", "id": str(repo.id), "title": repo.full_name}],
         }
 
+    # 同步状态是数据覆盖层的事实，不应由模型从空列表推断；这里直接返回 sync_metadata 和本地计数。
+    async def repo_sync_status(input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        if repo is None:
+            return {"route": "unknown", "tool_calls": [], "answer": "当前还没有可用仓库，请先连接仓库。", "citations": []}
+        metadata = repo.sync_metadata or {}
+        sources = metadata.get("sources") or {}
+        counts = {
+            "issues": db.query(Issue).filter(Issue.repo_id == repo.id).count(),
+            "pull_requests": db.query(PullRequest).filter(PullRequest.repo_id == repo.id).count(),
+            "workflow_runs": db.query(WorkflowRun).filter(WorkflowRun.repo_id == repo.id).count(),
+        }
+        source_lines = []
+        for key in ("issues", "pull_requests", "workflow_runs"):
+            source = sources.get(key) or {}
+            source_lines.append(
+                f"{key}: status={source.get('status', 'unknown')}, count={source.get('count', 0)}, "
+                f"complete={source.get('complete')}, pages={source.get('pages', 0)}"
+            )
+        errors = metadata.get("errors") or []
+        answer = (
+            f"仓库：{repo.full_name}\n"
+            f"最近同步状态：{metadata.get('status') or '未同步'}\n"
+            f"last_sync_at：{repo.last_sync_at.isoformat() if repo.last_sync_at else '无'}\n"
+            f"attempted_at：{metadata.get('attempted_at') or '无'}\n"
+            f"本地记录：Issue {counts['issues']}、PR {counts['pull_requests']}、CI {counts['workflow_runs']}\n"
+            f"数据源覆盖：\n" + "\n".join(f"- {line}" for line in source_lines)
+        )
+        if errors:
+            answer += "\n同步错误：\n" + "\n".join(f"- {error}" for error in errors[:5])
+        return {
+            "route": "repo_sync_status",
+            "tool_calls": [{"tool_name": "repo.get_sync_status", "arguments": {"repo_id": str(repo.id)}, "status": "success"}],
+            "answer": answer,
+            "citations": [{"type": "repository", "id": str(repo.id), "title": repo.full_name}],
+            "sync_status": {
+                "status": metadata.get("status"),
+                "last_sync_at": repo.last_sync_at.isoformat() if repo.last_sync_at else None,
+                "attempted_at": metadata.get("attempted_at"),
+                "limit": metadata.get("limit"),
+                "sources": sources,
+                "errors": errors,
+                "counts": counts,
+            },
+        }
+
     # 围绕工具提交的 query 执行语义/混合知识搜索，保留原始 message 与查询是否被改写。
     # 检索结果同时记为 RecallEvent，后续界面可检查模型是否真的补查了资料。
     # 重复调用不同 query 可以累积证据，不是只在对话前做一次固定检索。
@@ -1254,17 +1320,112 @@ def _build_conversation_tools(repo: Repository | None, conversation: Conversatio
     async def analyze_ci(input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         if repo is None:
             return await repo_health(input_data, context)
-        run = db.query(WorkflowRun).filter(WorkflowRun.repo_id == repo.id, WorkflowRun.conclusion == "failure").order_by(WorkflowRun.created_at.desc()).first()
+        runs = (
+            db.query(WorkflowRun)
+            .filter(WorkflowRun.repo_id == repo.id)
+            .order_by(WorkflowRun.created_at.desc())
+            .all()
+        )
+        run = next((item for item in runs if item.conclusion == "failure"), None)
         if not run:
-            result = await repo_health(input_data, context)
-            result["answer"] += "\n\n说明：本地没有失败 CI 记录，不能据此确认远端 CI 全部通过。"
-            return result
+            # 没有失败 run 不等于没有 CI 数据；先把已同步的成功/其它运行如实汇总出来。
+            summary = workflow_run_summary(runs)
+            latest = summary["latest"]
+            if not summary["total"]:
+                answer = "当前仓库尚未同步到任何 CI 运行记录；请先执行全量同步，再判断 CI 健康状态。"
+            else:
+                answer = (
+                    f"没有可排障的失败 CI。已同步 {summary['total']} 次运行："
+                    f"{summary['success']} 次成功、{summary['failure']} 次失败、{summary['other']} 次未完成或其它。"
+                    + (f"最近一次「{latest['name']}」{latest['conclusion'] or latest['status']}（{latest['created_at'] or '时间未知'}）。" if latest else "")
+                    + "这是本地同步覆盖到的结果；确认覆盖范围可调用 repo.get_sync_status。"
+                )
+            return {
+                "route": "ci_status",
+                "tool_calls": [
+                    {
+                        "tool_name": "ci.list_workflow_runs",
+                        "arguments": {"repo_id": str(repo.id)},
+                        "status": "success" if summary["total"] else "skipped",
+                    }
+                ],
+                "answer": answer,
+                "citations": (
+                    [{"type": "workflow_run", "id": latest["id"], "title": latest["name"]}] if latest else []
+                ),
+                "ci": summary,
+            }
         result = await CIDebugAgent().run({"name": run.name, "status": run.status, "conclusion": run.conclusion, "jobs": run.jobs or [], "logs_text": run.logs_text}, agent_context(context) | {"repo_id": str(repo.id)})
         return {
             "route": "ci_debug",
             "tool_calls": [{"tool_name": "ci_debug_agent.analyze_workflow_run", "arguments": {"run_id": str(run.id)}, "status": "success"}],
             "answer": f"最新失败 CI：{run.name}。失败类型：{result['failure_type']}。\n\n{result['failure_summary']}\n\n排查步骤：{_join_items(result['debug_steps'], '没有明确可用的排查步骤。')}",
             "citations": [{"type": "workflow_run", "id": str(run.id), "title": run.name}],
+        }
+
+    # 列出已同步的 CI run，供“CI 状态/有哪些运行/成功失败数量”类问题直接取数，而不是猜测。
+    async def list_ci_runs(input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        if repo is None:
+            return {"route": "unknown", "tool_calls": [], "answer": "当前还没有可用仓库，请先连接仓库。", "citations": []}
+        runs = (
+            db.query(WorkflowRun)
+            .filter(WorkflowRun.repo_id == repo.id)
+            .order_by(WorkflowRun.created_at.desc())
+            .all()
+        )
+        summary = workflow_run_summary(runs)
+        conclusion = str(input_data.get("conclusion") or "").strip().lower()
+        limit = min(max(int(input_data.get("limit") or 20), 1), 50)
+        filtered = [run for run in runs if not conclusion or (run.conclusion or "").lower() == conclusion]
+        selected = filtered[:limit]
+        metadata = repo.sync_metadata or {}
+        workflow_source = (metadata.get("sources") or {}).get("workflow_runs") or {}
+        lines = [
+            f"仓库：{repo.full_name}",
+            f"同步状态：{metadata.get('status') or '未同步'}"
+            + (f"；last_sync_at={repo.last_sync_at.isoformat()}" if repo.last_sync_at else ""),
+            f"CI 运行：共 {summary['total']} 条，成功 {summary['success']}，失败 {summary['failure']}，其它 {summary['other']}",
+            f"CI 数据源覆盖：{workflow_source.get('status', 'unknown')}，{workflow_source.get('count', 0)} 条，complete={workflow_source.get('complete')}",
+        ]
+        if summary["latest"]:
+            latest = summary["latest"]
+            lines.append(f"最近一次：{latest['name']} | {latest['conclusion'] or latest['status']} | {latest['created_at'] or '时间未知'}")
+        if summary["latest_failure"]:
+            failure = summary["latest_failure"]
+            lines.append(f"最近失败：{failure['name']} | {failure['created_at'] or '时间未知'}")
+        if selected:
+            lines.append("运行列表：")
+            lines.extend(
+                f"- {run.name} | {run.conclusion or run.status} | "
+                f"{run.created_at.isoformat() if run.created_at else '时间未知'} | {run.html_url or ''}"
+                for run in selected
+            )
+        else:
+            lines.append("运行列表：没有符合筛选条件的记录")
+        return {
+            "route": "ci_runs",
+            "tool_calls": [
+                {
+                    "tool_name": "ci.list_workflow_runs",
+                    "arguments": {"repo_id": str(repo.id), "conclusion": conclusion or None, "limit": limit},
+                    "status": "success",
+                }
+            ],
+            "answer": "\n".join(lines),
+            "citations": [{"type": "workflow_run", "id": str(run.id), "title": run.name} for run in selected[:5]],
+            "ci": summary,
+            "runs": [
+                {
+                    "id": str(run.id),
+                    "github_run_id": run.github_run_id,
+                    "name": run.name,
+                    "status": run.status,
+                    "conclusion": run.conclusion,
+                    "html_url": run.html_url,
+                    "created_at": run.created_at.isoformat() if run.created_at else None,
+                }
+                for run in selected
+            ],
         }
 
     async def generate_report(input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
@@ -1387,6 +1548,8 @@ def _build_conversation_tools(repo: Repository | None, conversation: Conversatio
         "workspace.read_file": read_workspace_file,
         "workspace.search_code": search_workspace_code,
         "repo_health.generate_summary": repo_health,
+        "repo.get_sync_status": repo_sync_status,
+        "ci.list_workflow_runs": list_ci_runs,
         "rag.search_similar_documents": semantic_search,
         "issue_agent.analyze_issue": analyze_issue,
         "pr_review_agent.analyze_pr": analyze_pr,

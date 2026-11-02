@@ -37,6 +37,7 @@ class IssueAgent(BaseAgent):
     # 把分类、建议、证据和置信度分别组织，后续前端不必从一段自由文本猜它们。
     # 关键词/规则只覆盖当前项目设定的常见场景，不能被描述为通用智能或严格根因证明。
     # 仍通过对应输出模型规范化，保持 fallback 与模型增强路径的返回契约一致。
+    # 用确定性规则先算出一份"结构永远合法"的分析结果，它既是模型失败时的替代返回，也是模型成功时的合并基线。
     def _fallback_analysis(self, input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         text = f"{input_data.get('title', '')} {input_data.get('body', '')}".lower()
         body = str(input_data.get("body") or "")
@@ -66,7 +67,7 @@ class IssueAgent(BaseAgent):
             action_items=checklist,
             drafts=drafts,
             confidence=confidence,
-        ).model_dump()
+        ).model_dump()   # 默认的fallback也有pydantic校验去做
 
     # 以规则结构为底，再让模型字段覆盖；随后对关键业务字段做补齐和约束。
     # checklist/action_items 互补，缺少证据/草稿结构时回填，证据还要去重。
@@ -74,6 +75,7 @@ class IssueAgent(BaseAgent):
     # 这样模型可增强表达，但不能仅因输出一个人名就凭空制造团队成员。
     # 最后由 run 校验完整 schema；合并字典本身不保证字段类型已经正确。
     def _merge_with_fallback(self, output: dict[str, Any], fallback: dict[str, Any], input_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        # **是dict 合并语法，两个 dict 有同名 key 时，右边的值覆盖左边。所以模型输出优先覆盖，规则兜底保底
         merged = {**fallback, **output}
         if not merged.get("checklist") and merged.get("action_items"):
             merged["checklist"] = merged["action_items"]

@@ -304,6 +304,31 @@ type RepoConnectResult = {
   synced?: Record<string, number>;
 };
 
+type RepoFullSyncResult = {
+  repo_id: string;
+  status: string;
+  synced: { issues: number; pull_requests: number; workflow_runs: number };
+  sources: Record<string, { status: string; count: number; complete: boolean; pages: number }>;
+  errors: string[];
+  message: string;
+  metadata_refreshed: boolean;
+  metadata_error?: string | null;
+  metadata?: {
+    description?: string | null;
+    default_branch?: string | null;
+    clone_url?: string | null;
+    github_id?: number | null;
+  } | null;
+};
+
+// 全量同步结果固定在触发时的仓库上，切换项目后不应把旧提示挂到新项目下。
+type FullSyncStatus = {
+  repoId: string;
+  kind: "success" | "warning" | "error";
+  title: string;
+  detail: string;
+};
+
 type ProjectConversation = {
   id: string;
   repo_id: string;
@@ -964,7 +989,9 @@ export default function DashboardPage() {
   const [analysisModalRunId, setAnalysisModalRunId] = useState<string | null>(null);
   const [analyzingRunId, setAnalyzingRunId] = useState<string | null>(null);
   const [ciAnalysisError, setCiAnalysisError] = useState<string | null>(null);
-  const [syncing, setSyncing] = useState(false);  // 同步请求正在进行，不等于最终同步完整
+  const [syncing, setSyncing] = useState(false);  // 快速刷新请求正在进行，不等于最终同步完整
+  const [fullSyncing, setFullSyncing] = useState(false);  // 全量同步独立状态，但与快速刷新互斥
+  const [fullSyncStatus, setFullSyncStatus] = useState<FullSyncStatus | null>(null);
   const skipHistoryLoadRef = useRef(false);  // 本地已衔接新会话时，跳过一次重复历史覆盖
   const preserveWorkspaceSelectionRef = useRef(false);  // 特定跳转保留选择，普通切换则重置
   // AbortController 跨渲染保存在 ref，点击停止时取消当前读取；ref 更新不触发额外渲染。
@@ -986,6 +1013,7 @@ export default function DashboardPage() {
   const promptSuggestions = selectedPromptState?.suggestions ?? [];
   const promptExclude = selectedPromptState?.exclude ?? [];
   const loadingPrompts = Boolean(selectedRepo?.id && loadingPromptRepoId === selectedRepo.id);
+  const syncBusy = syncing || fullSyncing;  // 任一同步进行中，所有手动同步入口都禁用，避免并发写入
 
   async function loadRepos() {
     const items = await apiGet<Repository[]>("/api/repos");
@@ -1872,32 +1900,75 @@ export default function DashboardPage() {
     await loadKnowledgeGraph(selectedRepo.id);
   }
 
+  // 同步完成后统一重载首页依赖的数据；同步状态和错误提示由调用方负责。
+  async function reloadDashboardData(repoId: string) {
+    await Promise.all([
+      loadRepos(),
+      loadRepoData(repoId),
+      loadProjectKnowledge(repoId),
+      loadProjectIndexState(repoId),
+      loadKnowledgeGraph(repoId),
+      loadRepoConversations(repoId)
+    ]);
+    setPromptStateByRepo((items) => {
+      const next = { ...items };
+      delete next[repoId];
+      return next;
+    });
+    await loadPromptSuggestions(repoId);
+  }
+
   async function refreshSelectedRepo() {
-    if (!selectedRepo) return;
+    if (!selectedRepo || syncBusy) return;
+    const repoId = selectedRepo.id;
     setSyncing(true);
     try {
-      await apiPost(`/api/repos/${selectedRepo.id}/sync`, {
+      await apiPost(`/api/repos/${repoId}/sync`, {
         sync_issues: true,
         sync_pull_requests: true,
         sync_workflow_runs: true,
         limit: 50
       });
-      await Promise.all([
-        loadRepos(),
-        loadRepoData(selectedRepo.id),
-        loadProjectKnowledge(selectedRepo.id),
-        loadProjectIndexState(selectedRepo.id),
-        loadKnowledgeGraph(selectedRepo.id),
-        loadRepoConversations(selectedRepo.id)
-      ]);
-      setPromptStateByRepo((items) => {
-        const next = { ...items };
-        delete next[selectedRepo.id];
-        return next;
-      });
-      await loadPromptSuggestions(selectedRepo.id);
+      await reloadDashboardData(repoId);
     } finally {
       setSyncing(false);
+    }
+  }
+
+  // 全量同步等价于首次导入的完整重跑；元数据刷新失败只降级为警告，不阻断事实同步。
+  async function runFullSync() {
+    if (!selectedRepo || syncBusy) return;
+    const repoId = selectedRepo.id;
+    setFullSyncing(true);
+    setFullSyncStatus(null);
+    try {
+      const result = await apiPost<RepoFullSyncResult>(`/api/repos/${repoId}/full-sync`, {});
+      await reloadDashboardData(repoId);
+      const counts = result.synced ?? { issues: 0, pull_requests: 0, workflow_runs: 0 };
+      const branch = result.metadata?.default_branch || "未知";
+      const metadataText = result.metadata_refreshed
+        ? `仓库元数据已刷新（默认分支 ${branch}）`
+        : `仓库元数据未刷新（${result.metadata_error || "未知原因"}）`;
+      const countText = `Issue ${counts.issues} 条、PR ${counts.pull_requests} 条、CI ${counts.workflow_runs} 条`;
+      const messageText = result.message.replace(/[。；\s]+$/, "");
+      const errorText = result.errors.length
+        ? `；错误：${result.errors.slice(0, 3).join("；")}${result.errors.length > 3 ? `；另有 ${result.errors.length - 3} 项` : ""}`
+        : "";
+      if (result.status === "failed") {
+        setFullSyncStatus({ repoId, kind: "error", title: "全量同步失败", detail: `${metadataText}；${countText}。${messageText}${errorText}` });
+      } else if (result.status === "partial") {
+        setFullSyncStatus({ repoId, kind: "warning", title: "全量同步部分完成", detail: `${metadataText}；${countText}。${messageText}${errorText}` });
+      } else if (!result.metadata_refreshed) {
+        setFullSyncStatus({ repoId, kind: "warning", title: "同步完成，但元数据刷新失败", detail: `${metadataText}；${countText}。代码同步与代码图重建已在后台启动。` });
+      } else if (result.status === "empty") {
+        setFullSyncStatus({ repoId, kind: "warning", title: "同步完成，但远端没有数据", detail: `${metadataText}；Issue、PR、CI 均未返回记录。` });
+      } else {
+        setFullSyncStatus({ repoId, kind: "success", title: "全量同步完成", detail: `${metadataText}；${countText}。代码同步与代码图重建已在后台启动。` });
+      }
+    } catch (error) {
+      setFullSyncStatus({ repoId, kind: "error", title: "全量同步失败", detail: getFriendlyError(error) });
+    } finally {
+      setFullSyncing(false);
     }
   }
 
@@ -2549,7 +2620,7 @@ export default function DashboardPage() {
               </button>
               <button
                 onClick={refreshSelectedRepo}
-                disabled={!selectedRepo || syncing}
+                disabled={!selectedRepo || syncBusy}
                 className="inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-700 transition hover:bg-white disabled:opacity-50"
                 title="刷新当前项目"
               >
@@ -2656,7 +2727,7 @@ export default function DashboardPage() {
           <div className="border-t border-line p-3">
             <button
               onClick={refreshSelectedRepo}
-              disabled={!selectedRepo || syncing}
+              disabled={!selectedRepo || syncBusy}
               className="inline-flex w-full items-center justify-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-teal-50 disabled:opacity-60"
             >
               <RefreshCw className={`h-4 w-4 ${syncing ? "animate-spin" : ""}`} />
@@ -2677,6 +2748,17 @@ export default function DashboardPage() {
                 <h2 className="font-semibold text-ink">总览</h2>
                 <span className="text-xs text-slate-500">当前代码仓</span>
                 <span className="truncate text-sm font-semibold text-ink">{selectedRepo?.full_name || "未选择仓库"}</span>
+                <button
+                  type="button"
+                  onClick={runFullSync}
+                  disabled={!selectedRepo || syncBusy}
+                  className="inline-flex h-7 shrink-0 items-center gap-1.5 self-center rounded-md border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-teal-50 disabled:opacity-60"
+                  title="从 GitHub 全量重新同步仓库元数据、全部 Issue/PR/CI，并在后台重建代码图"
+                  aria-label="全量重新同步仓库"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${fullSyncing ? "animate-spin" : ""}`} />
+                  {fullSyncing ? "同步中..." : "全量同步"}
+                </button>
                 {selectedConversation && <span className="rounded-full bg-panel px-2 py-0.5 text-xs text-slate-600">会话：{selectedConversation.title}</span>}
               </div>
             </div>
@@ -2687,6 +2769,21 @@ export default function DashboardPage() {
               </button>
             </div>
           </div>
+          {fullSyncStatus && fullSyncStatus.repoId === selectedRepo?.id && (
+            <div
+              aria-live="polite"
+              className={`mt-2 rounded-md border px-3 py-2 text-xs leading-5 ${
+                fullSyncStatus.kind === "success"
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                  : fullSyncStatus.kind === "warning"
+                    ? "border-amber-200 bg-amber-50 text-amber-800"
+                    : "border-rose-200 bg-rose-50 text-rose-800"
+              }`}
+            >
+              <div className="font-semibold">{fullSyncStatus.title}</div>
+              <div className="mt-0.5 break-words">{fullSyncStatus.detail}</div>
+            </div>
+          )}
           <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
             <MetricCard icon={ListTodo} label="待处理 Issue" value={openIssues.length} />
             <MetricCard icon={GitPullRequest} label="待 Review PR" value={openPrs.length} />
@@ -2709,7 +2806,7 @@ export default function DashboardPage() {
                 </div>
                 <button
                   onClick={refreshSelectedRepo}
-                  disabled={!selectedRepo || syncing}
+                  disabled={!selectedRepo || syncBusy}
                   className="inline-flex h-8 items-center gap-1.5 rounded-md border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-teal-50 disabled:opacity-60"
                   title="刷新 Issue/PR/CI"
                   aria-label="刷新 Issue/PR/CI"
